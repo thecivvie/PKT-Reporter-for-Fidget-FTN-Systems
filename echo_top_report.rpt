@@ -1,0 +1,54 @@
+TCOB1 EchoMail top stats for area LINUX_BBS
+(DB schema v2)
+Statistics from 12-Dec-25 to 01-Feb-26
+Total messages in range: 57
+
+Top posters
+===========
+#  Poster              Msgs
+---------------------------
+1  Sean Rima             21
+2  Stephen Walsh         17
+3  Tommi Koivula          9
+4  Benny Pedersen         4
+5  Richard Menedetter     3
+6  Moderator              2
+7  Mickey                 1
+
+Top subjects
+============
+#  Subject                                  Msgs
+------------------------------------------------
+1  PyGate Has been released                   34
+2  Linux filefix other than husky              8
+3  Soupgate/Spoon                              8
+4  Pygate Timeout problem                      4
+5  Automated monthly link check/echo rules     2
+6  PKT Reporter released                       1
+
+Top posters by total message size
+=================================
+#  Poster              Total   Max
+----------------------------------
+1  Sean Rima           23.7K  6.9K
+2  Stephen Walsh       23.1K  4.7K
+3  Tommi Koivula       12.1K  3.0K
+4  Benny Pedersen       3.5K  997B
+5  Richard Menedetter   3.1K  1.2K
+6  Moderator            1.5K  788B
+7  Mickey               1.3K  1.3K
+
+Largest individual messages
+===========================
+ #      Size  Poster                Subject
+------------------------------------------------------------
+ 1      6.9K  Sean Rima             PKT Reporter released
+ 2      4.7K  Stephen Walsh         PyGate Has been released
+ 3      3.0K  Tommi Koivula         Pygate Timeout problem
+ 4      1.8K  Stephen Walsh         Pygate Timeout problem
+ 5      1.7K  Tommi Koivula         PyGate Has been released
+ 6      1.6K  Sean Rima             PyGate Has been released
+ 7      1.6K  Stephen Walsh         Pygate Timeout problem
+ 8      1.5K  Stephen Walsh         PyGate Has been released
+ 9      1.4K  Stephen Walsh         PyGate Has been released
+10      1.4K  Tommi Koivula         PyGate Has been released
