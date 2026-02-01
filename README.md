@@ -187,22 +187,7 @@ TOP report for one echo:
 
 ## 📊 Example Output
 
-Statistics from 26-Jan-26 to 01-Feb-26
-
-Area                            26   27   28   29   30   31   01   Total
-========================================================================
-MIN_CHAT                         4    6    3    9    2    1    5 :    30
-MIN_WEATHER                      1    0    2    1    0    3    2 :     9
-========================================================================
-TOTALS                           5    6    5   10    2    4    7 :    39
-
-TOP message size example:
-
-=== TOP POSTERS BY TOTAL MESSAGE SIZE ===
-Poster           Messages   Total KB   Avg KB   Max KB
-------------------------------------------------------
-Sean                  42       418.2      9.9     22.1
-MurphyBot             18       146.5      8.1     18.6
+See files with .rpt extensions
 
 -----------------------------------------------------------------------
 
