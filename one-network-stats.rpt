@@ -1,0 +1,25 @@
+TCOB1 EchoMail area reporter
+(DB schema v2)
+
+Statistics from 26-Jan-26 to 01-Feb-26
+
+Area                                26   27   28   29   30   31   01   Total
+============================================================================
+L618_PLY                             0    0    0    0    0    0    0 :     0
+L618_SCR                             0    0    0    0    0    0    0 :     0
+L618_SYS                             0    0    0    0    0    0    0 :     0
+MIN_ADMIN                            0    0    3    0    0    2    4 :     9
+MIN_BBS                              0    0    0    0    0    0    2 :     2
+MIN_BBSADS                           0    0    0    0    0    2    0 :     2
+MIN_CHAT                             7   19   11    4    6    2    2 :    51
+MIN_COMP                             3    3    0    0    0    0   16 :    22
+MIN_COOKING                          0    0    0    0    0    0    0 :     0
+MIN_DEBATE                           2    4    0    0    0    2    0 :     8
+MIN_FILEFIND                         0    0    0    0    0    0    0 :     0
+MIN_GAMES                           10   10   10   10   10   11   10 :    71
+MIN_GENAN                            5    5    5    5   17    5    7 :    49
+MIN_PB                               0    0    0    0    0    0    0 :     0
+MIN_TEST                             0    0    0    0    0    0    0 :     0
+MIN_WEATHER                         14   18   14   15   14   14    8 :    97
+============================================================================
+TOTALS                              41   59   43   34   47   38   49 :   311
