@@ -350,11 +350,19 @@ def main():
     if not folder.is_dir():
         raise SystemExit(f"Not a directory: {folder}")
 
-    pattern = "**/*.pkt" if args.recursive else "*.pkt"
-    pkt_files = sorted(folder.glob(pattern))
+    # Case-insensitive PKT discovery (.pkt, .PKT, etc.)
+    if args.recursive:
+        candidates = folder.rglob("*")
+    else:
+        candidates = folder.iterdir()
+
+    pkt_files = sorted(
+        p for p in candidates
+        if p.is_file() and p.suffix.lower() == ".pkt"
+    )
 
     if not pkt_files:
-        print(f"No .pkt files found in {folder}")
+        print(f"No .pkt files found in {folder} (case-insensitive .pkt scan)")
         return
 
     if args.test:
