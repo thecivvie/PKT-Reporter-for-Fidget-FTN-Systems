@@ -1,0 +1,7 @@
+#!/bin/bash
+
+cd /home/fmail
+
+fmail toss  -b
+
+./pkt_indexer.py --folder ftn/statsbox --db ftn/pkt_index.db --delete
