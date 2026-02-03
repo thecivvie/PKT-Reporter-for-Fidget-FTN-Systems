@@ -1,0 +1,5 @@
+pkt_report.py --db=ftn/pkt_index.db --days 7 --only-areas known_areas.txt > stats.txt
+ftools post  /home/fmail/stats.txt  "MIN_GENAN" -from "TCOB1 Info Service" -subj "Micronet Echo Areas 7 Day Stats"
+rm stats.txt
+pkt_report.py --db=ftn/pkt_index.db --days 7 > stats.txt
+ftools post  /home/fmail/stats.txt  "TCOB1.INFO" -from "TCOB1 Info Service" -subj "FTN Areas 7 Day Stats"
