@@ -1,362 +1,720 @@
 #!/usr/bin/env python3
-"""
-fido_attach_mover.py
---------------------
-Scans a folder of FidoNet .msg (Hudson/SquishMail binary) netmail messages.
-For any message that is a file-attach (FLAGS DIR) addressed to one of the
-configured destination addresses, the script:
-  1. Moves the attached file to DEST_FOLDER
-  2. Deletes the original attachment from its source location
-  3. Deletes the .msg file itself
+# -*- coding: utf-8 -*-
 
-Run with TEST_MODE = True to see what *would* happen without touching anything.
+#!/usr/bin/env python3
+# -----------------------------------------------------------------------------
+# pkt_report.py
+#
+# Copyright (c) 2026 Sean Rima and Murphy
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# -----------------------------------------------------------------------------
 
-All configuration lives in the CONFIG block below.
-"""
 
-import os
+import argparse
+import sqlite3
+import json
 import re
-import shutil
-import struct
-import logging
+from datetime import datetime, timedelta
+from collections import defaultdict
+from textwrap import shorten
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
+# Date parsing
+# ----------------------------------------------------------------------
 
-# Folder containing the .msg files to process
-MSG_FOLDER = "/home/bbbs/fido/mail"
+def parse_date_any(s: str) -> datetime:
+    s = (s or "").strip()
+    if not s:
+        raise ValueError("empty date")
 
-# Where to move matched attachment files
-DEST_FOLDER = "/home/bbbs/fido/reporter"
-
-# FidoNet addresses to match in the To: field.
-# Accepts 5D (zone:net/node.point) or 4D (zone:net/node) forms.
-# Point part is optional – "2:263/1" matches node 2:263/1 regardless of point.
-# Add as many addresses as you like.
-TARGET_ADDRESSES = [
-    "2:263/1.100",
-    "618:500/1.100",
-    "21:1/229.100",
-    "86:553/20.100",
-    "314:413/30.100",
-    "46:20/119.100",
-    "999:1/10.100",
-]
-
-# Set to True to log actions without moving or deleting anything
-TEST_MODE = False
-
-# Log level: logging.DEBUG shows raw kludge parsing details
-LOG_LEVEL = logging.INFO
-
-# ─────────────────────────────────────────────────────────────────────────────
-# END CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
-
-
-# ── .msg binary layout (Hudson/FIDO style, 238 bytes fixed header) ────────────
-#
-#  Offset  Size  Field
-#  0       36    From name (null-padded)
-#  36      36    To name   (null-padded)
-#  72      72    Subject / attached filename (null-padded)
-#  144     20    Date string (null-padded)
-#  164     2     Times read
-#  166     2     Dest node
-#  168     2     Orig node
-#  170     2     Cost
-#  172     2     Orig net
-#  174     2     Dest net
-#  176     4     (date written, unused here)
-#  180     4     (date arrived, unused here)
-#  184     2     Reply
-#  186     4     Attribute word (see FLAG_* below)
-#  190     2     Next
-#  192     2     Orig zone / text length (varies by variant)
-#  194-237       padding / zone bytes
-#  238+          Message text (kludge lines + body)
-#
-# Attribute flags (word at offset 186):
-FLAG_FILE   = 0x0010   # Message has file attach
-FLAG_KFS    = 0x0200   # Kill File after Sent (= KFS in FLAGS line)
-# DIR (direct) is a kludge flag not a header bit in most implementations,
-# but we detect it in the kludge lines too.
-
-HEADER_SIZE = 190  # We only need up to the attribute word reliably
-
-MSG_HEADER_FMT = "<36s36s72s20sHHHHHH4s4sHIH"
-MSG_HEADER_FIELDS = (
-    "from_name", "to_name", "subject",
-    "date_str",
-    "times_read",
-    "dest_node", "orig_node", "cost",
-    "orig_net", "dest_net",
-    "_dw", "_da",
-    "reply", "attr", "next_msg",
-)
-
-
-def parse_msg_header(data: bytes) -> dict:
-    """Parse the fixed 190-byte Hudson .msg header."""
-    size = struct.calcsize(MSG_HEADER_FMT)
-    if len(data) < size:
-        raise ValueError(f"File too short for header (need {size}, got {len(data)})")
-    fields = struct.unpack(MSG_HEADER_FMT, data[:size])
-    h = {k: v for k, v in zip(MSG_HEADER_FIELDS, fields)}
-    # Decode null-terminated strings
-    for key in ("from_name", "to_name", "subject", "date_str"):
-        h[key] = h[key].split(b"\x00")[0].decode("cp437", errors="replace").strip()
-    return h
-
-
-def parse_kludges(text: bytes) -> dict[str, list[str]]:
-    """
-    Extract FidoNet kludge lines (0x01-prefixed) from message text.
-    Returns a dict of {KLUDGE_NAME: [value, ...]} (upper-cased key).
-    """
-    kludges: dict[str, list[str]] = {}
-    for line in text.split(b"\r"):
-        if line.startswith(b"\x01"):
-            parts = line[1:].decode("cp437", errors="replace").split(None, 1)
-            if parts:
-                key = parts[0].upper()
-                val = parts[1] if len(parts) > 1 else ""
-                kludges.setdefault(key, []).append(val.strip())
-    return kludges
-
-
-def fido_addr_to_tuple(addr: str):
-    """
-    Convert a FidoNet address string to a comparable tuple.
-    Returns (zone, net, node, point) with point=0 if not specified.
-    Accepts: "2:263/1.100", "2:263/1", "618:500/1.100"
-    """
-    addr = addr.strip()
-    m = re.match(r"^(\d+):(\d+)/(\d+)(?:\.(\d+))?$", addr)
-    if not m:
-        raise ValueError(f"Cannot parse FidoNet address: {addr!r}")
-    zone, net, node = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    point = int(m.group(4)) if m.group(4) else 0
-    return (zone, net, node, point)
-
-
-def build_target_set(addresses: list[str]):
-    """
-    Build a set of (zone, net, node, point) tuples from config addresses.
-    Also builds a set of node-only tuples for addresses without a point,
-    so "2:263/1" matches "2:263/1.100" as well.
-    Returns (exact_set, node_wildcards).
-    """
-    exact = set()
-    wildcards = set()  # (zone, net, node) – match any point
-    for addr in addresses:
-        t = fido_addr_to_tuple(addr)
-        exact.add(t)
-        if t[3] == 0:
-            wildcards.add(t[:3])
-    return exact, wildcards
-
-
-def addr_matches(addr_tuple, exact_set, wildcards):
-    """Return True if addr_tuple matches the configured targets."""
-    if addr_tuple in exact_set:
-        return True
-    # Try without point
-    if addr_tuple[:3] in wildcards:
-        return True
-    return False
-
-
-def resolve_to_address(header: dict, kludges: dict) -> tuple | None:
-    """
-    Derive the true destination FidoNet address.
-    Priority:
-      1. INTL kludge  → "zone:net/node zone:net/node"  (dest is first token)
-         combined with TOPT kludge for point
-      2. Header dest_net / dest_node (zone unknown without INTL)
-    Returns (zone, net, node, point) or None on failure.
-    """
-    intl_vals = kludges.get("INTL", [])
-    topt_vals = kludges.get("TOPT", [])
-    point = 0
-    if topt_vals:
+    fmts = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+        "%d %b %y %H:%M:%S",
+        "%d-%b-%Y %H:%M",
+        "%d-%b-%y",
+    ]
+    last_err = None
+    for fmt in fmts:
         try:
-            point = int(topt_vals[0])
-        except ValueError:
+            return datetime.strptime(s, fmt)
+        except ValueError as e:
+            last_err = e
             pass
+    raise ValueError(f"Unrecognized date format: {s!r}")
 
-    if intl_vals:
-        # INTL value: "dest_addr orig_addr"
-        dest_str = intl_vals[0].split()[0]
-        try:
-            t = fido_addr_to_tuple(dest_str)
-            return (t[0], t[1], t[2], point)
-        except ValueError:
-            log.debug("Could not parse INTL dest %r", dest_str)
+def nice_header_date(s: str) -> str:
+    return parse_date_any(s).strftime("%d-%b-%y")
 
-    # Fallback: use header node/net, zone unknown (0)
-    net = header.get("dest_net", 0)
-    node = header.get("dest_node", 0)
-    if net or node:
-        log.debug("No INTL kludge; falling back to header net=%d node=%d", net, node)
-        return (0, net, node, point)
+# ----------------------------------------------------------------------
+# DB helpers
+# ----------------------------------------------------------------------
 
+def table_columns(conn, table: str):
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    return [r[1] for r in cur.fetchall()]
+
+def pick_date_expression(cols):
+    """Prefer date_iso, then imported_at, then date_raw.
+
+    Uses COALESCE + NULLIF so empty strings don't break range queries.
+    """
+    parts = []
+    if "date_iso" in cols:
+        parts.append("NULLIF(TRIM(date_iso),'')")
+    if "imported_at" in cols:
+        parts.append("NULLIF(TRIM(imported_at),'')")
+    if "date_raw" in cols:
+        parts.append("NULLIF(TRIM(date_raw),'')")
+
+    if not parts:
+        raise SystemExit("pkt_messages has no usable date columns (need date_iso/imported_at/date_raw).")
+
+    return "COALESCE(" + ", ".join(parts) + ")"
+
+# ----------------------------------------------------------------------
+# Buckets
+# ----------------------------------------------------------------------
+
+def month_bucket(dt: datetime) -> int:
+    # Jan/Feb/Mar shown as 13/14/15 to match your seasonal sample layout
+    return dt.month + 12 if dt.month in (1, 2, 3) else dt.month
+
+def build_month_columns(dt_min: datetime, dt_max: datetime):
+    """Build an ordered list of (year, month) tuples spanning dt_min..dt_max inclusive.
+
+    Unlike month_bucket()/the fixed 15..09 seasonal layout, this walks real
+    calendar months so it works correctly across year boundaries (e.g. a
+    trailing 7-month window that crosses Dec/Jan).
+    """
+    cols = []
+    y, m = dt_min.year, dt_min.month
+    end_y, end_m = dt_max.year, dt_max.month
+    while (y < end_y) or (y == end_y and m <= end_m):
+        cols.append((y, m))
+        m += 1
+        if m == 13:
+            m = 1
+            y += 1
+    return cols
+
+
+def build_day_columns(dt_min: datetime, dt_max: datetime):
+    """Build a list of daily column keys across the inclusive range.
+
+    We use *date objects* as the internal keys so counting is unambiguous,
+    but we can still print a tidy header (DD only) even across month changes.
+    """
+    cols = []
+    d = dt_min.date()
+    end = dt_max.date()
+    while d <= end:
+        cols.append(d)
+        d += timedelta(days=1)
+    return cols
+
+# ----------------------------------------------------------------------
+# Top-per-echo helpers
+# ----------------------------------------------------------------------
+
+def _pick_first_column(cols, candidates):
+    """Return the first column name from candidates that exists in cols, or None."""
+    for c in candidates:
+        if c in cols:
+            return c
     return None
 
+def _normalize_subject(subj: str) -> str:
+    """Normalise subject so that replies with RE: count towards the same thread.
 
-def is_file_attach(header: dict, kludges: dict) -> bool:
+    Strips common "RE:" / "Re:" / "re[2]:" style prefixes repeatedly.
     """
-    Return True if the message is a file-attach.
-    Checks: attribute FLAG_FILE bit, or FLAGS kludge containing DIR.
+    if not subj:
+        return "(no subject)"
+    s = subj.strip()
+    # Strip repeated RE-style prefixes
+    s = re.sub(r'^(re(\[\d+\])?:\s*)+', '', s, flags=re.IGNORECASE)
+    s = s.strip()
+    return s or "(no subject)"
+
+def run_top_report(conn, date_expr: str, date_from: str, date_to: str, echo_name: str,
+                   schema_version: str, limit: int = 10) -> None:
+    """Print top posters/subjects for a single echo.
+
+    If the database includes a message size column, also prints size-based TOP tables.
     """
-    if header.get("attr", 0) & FLAG_FILE:
-        return True
-    flags = " ".join(kludges.get("FLAGS", []))
-    if "DIR" in flags.upper():
-        return True
-    return False
+    cur = conn.cursor()
+    cols = table_columns(conn, "pkt_messages")
 
-
-def get_attachment_path(header: dict, kludges: dict) -> str | None:
-    """
-    Return the attachment file path.
-    The subject field holds the path in Hudson .msg file-attach messages.
-    """
-    path = header.get("subject", "").strip()
-    return path if path else None
-
-
-def process_msg_file(msg_path: str, exact_set, wildcards, test_mode: bool) -> bool:
-    """
-    Process a single .msg file.
-    Returns True if it was matched and actioned (or would be in test mode).
-    """
-    try:
-        with open(msg_path, "rb") as f:
-            data = f.read()
-    except OSError as e:
-        log.error("Cannot read %s: %s", msg_path, e)
-        return False
-
-    try:
-        header = parse_msg_header(data)
-    except (ValueError, struct.error) as e:
-        log.warning("Skipping %s – header parse error: %s", msg_path, e)
-        return False
-
-    # Text body starts at fixed offset 190 in Hudson .msg format.
-    # (struct.calcsize may be 192 due to alignment padding, which would
-    #  clip the first two bytes of the kludge block.)
-    text_body = data[190:]
-    kludges = parse_kludges(text_body)
-
-    log.debug("MSG %s | to=%r subject=%r attr=0x%04x kludges=%s",
-              os.path.basename(msg_path),
-              header["to_name"], header["subject"],
-              header.get("attr", 0), list(kludges))
-
-    if not is_file_attach(header, kludges):
-        log.debug("  → not a file-attach, skipping")
-        return False
-
-    to_addr = resolve_to_address(header, kludges)
-    if to_addr is None:
-        log.warning("  → could not determine destination address in %s", msg_path)
-        return False
-
-    addr_str = f"{to_addr[0]}:{to_addr[1]}/{to_addr[2]}.{to_addr[3]}"
-    log.debug("  → resolved To address: %s", addr_str)
-
-    if not addr_matches(to_addr, exact_set, wildcards):
-        log.debug("  → address %s not in target list, skipping", addr_str)
-        return False
-
-    attach_path = get_attachment_path(header, kludges)
-    if not attach_path:
-        log.warning("  → matched address %s but no attachment path in %s", addr_str, msg_path)
-        return False
-
-    log.info("MATCH: %s → to=%s attach=%s",
-             os.path.basename(msg_path), addr_str, attach_path)
-
-    attach_exists = os.path.isfile(attach_path)
-    attach_name = os.path.basename(attach_path)
-    dest_path = os.path.join(DEST_FOLDER, attach_name)
-
-    if test_mode:
-        log.info("  [TEST] Would move attachment: %s → %s", attach_path, dest_path)
-        if not attach_exists:
-            log.warning("  [TEST] Attachment not found on disk: %s", attach_path)
-        log.info("  [TEST] Would delete .msg: %s", msg_path)
-        return True
-
-    # ── Live mode ────────────────────────────────────────────────────────────
-    os.makedirs(DEST_FOLDER, exist_ok=True)
-
-    if attach_exists:
-        try:
-            shutil.move(attach_path, dest_path)
-            log.info("  Moved attachment: %s → %s", attach_path, dest_path)
-        except OSError as e:
-            log.error("  Failed to move attachment %s: %s", attach_path, e)
-            return False
-    else:
-        log.warning("  Attachment not found on disk (already gone?): %s", attach_path)
-
-    try:
-        os.remove(msg_path)
-        log.info("  Deleted .msg: %s", msg_path)
-    except OSError as e:
-        log.error("  Failed to delete .msg %s: %s", msg_path, e)
-        return False
-
-    return True
-
-
-def main():
-    log.info("fido_attach_mover starting%s", " [TEST MODE]" if TEST_MODE else "")
-    log.info("MSG folder   : %s", MSG_FOLDER)
-    log.info("Dest folder  : %s", DEST_FOLDER)
-    log.info("Target addrs : %s", TARGET_ADDRESSES)
-
-    try:
-        exact_set, wildcards = build_target_set(TARGET_ADDRESSES)
-    except ValueError as e:
-        log.error("Bad address in TARGET_ADDRESSES: %s", e)
-        return
-
-    if not os.path.isdir(MSG_FOLDER):
-        log.error("MSG_FOLDER does not exist: %s", MSG_FOLDER)
-        return
-
-    msg_files = sorted(
-        f for f in os.listdir(MSG_FOLDER)
-        if f.lower().endswith(".msg")
+    poster_col = _pick_first_column(
+        cols,
+        ["from_name", "from_addr", "origin_name", "origin_addr", "sender"]
+    )
+    subj_col = _pick_first_column(
+        cols,
+        ["subject", "subj", "title"]
     )
 
-    if not msg_files:
-        log.info("No .msg files found in %s", MSG_FOLDER)
+    # Optional message size columns (bytes) and lines.
+    size_col = _pick_first_column(
+        cols,
+        ["msg_size", "message_size", "size_bytes", "msg_bytes", "bytes"]
+    )
+    lines_col = _pick_first_column(
+        cols,
+        ["msg_lines", "message_lines", "lines"]
+    )
+
+    if not poster_col or not subj_col:
+        missing = []
+        if not poster_col:
+            missing.append("poster column (from_name/from_addr/origin_name/origin_addr/sender)")
+        if not subj_col:
+            missing.append("subject column (subject/subj/title)")
+        raise SystemExit("pkt_messages table is missing required columns: " + ", ".join(missing))
+
+    select_bits = [
+        f"{poster_col} AS poster",
+        f"{subj_col} AS subject",
+    ]
+    if size_col:
+        select_bits.append(f"{size_col} AS msg_size")
+    if lines_col:
+        select_bits.append(f"{lines_col} AS msg_lines")
+
+    cur.execute(
+        f"""
+        SELECT {', '.join(select_bits)}
+        FROM pkt_messages
+        WHERE UPPER(echo) = UPPER(?)
+          AND {date_expr} >= ? AND {date_expr} <= ?
+        """,
+        (echo_name, date_from, date_to),
+    )
+    rows = cur.fetchall()
+
+    if not rows:
+        print(f"No messages found in echo {echo_name!r} for selected date range.")
         return
 
-    log.info("Found %d .msg file(s)", len(msg_files))
-    matched = 0
-    for fname in msg_files:
-        full_path = os.path.join(MSG_FOLDER, fname)
-        if process_msg_file(full_path, exact_set, wildcards, TEST_MODE):
-            matched += 1
+    from collections import Counter
 
-    log.info("Done. %d/%d messages matched.", matched, len(msg_files))
-    if TEST_MODE:
-        log.info("(No files were moved or deleted – TEST_MODE is True)")
+    poster_counts = Counter()
+    subject_counts = Counter()
 
+    # Optional size aggregations per poster
+    poster_total_bytes = Counter()
+    poster_max_bytes = Counter()
+    poster_total_lines = Counter()
+    poster_max_lines = Counter()
+
+    # Optional list of largest single messages
+    biggest_msgs = []  # (size_bytes, lines, poster, subject_root)
+
+    for r in rows:
+        poster = (r["poster"] or "").strip() or "(unknown)"
+        poster_counts[poster] += 1
+
+        root = _normalize_subject(r["subject"])
+        subject_counts[root] += 1
+
+        if size_col:
+            try:
+                sz = int(r["msg_size"] or 0)
+            except Exception:
+                sz = 0
+            poster_total_bytes[poster] += max(sz, 0)
+            poster_max_bytes[poster] = max(poster_max_bytes.get(poster, 0), max(sz, 0))
+
+            if sz > 0:
+                ln = 0
+                if lines_col:
+                    try:
+                        ln = int(r["msg_lines"] or 0)
+                    except Exception:
+                        ln = 0
+                biggest_msgs.append((sz, ln, poster, root))
+
+        if lines_col:
+            try:
+                ln2 = int(r["msg_lines"] or 0)
+            except Exception:
+                ln2 = 0
+            poster_total_lines[poster] += max(ln2, 0)
+            poster_max_lines[poster] = max(poster_max_lines.get(poster, 0), max(ln2, 0))
+
+    def print_top_table(counter, label_header: str, title: str):
+        print()
+        print(title)
+        print("=" * len(title))
+
+        items = counter.most_common(limit)
+        if not items:
+            print("(no data)")
+            return
+
+        rank_width = len(str(len(items)))
+        max_count = max(c for _, c in items)
+        count_width = max(len("Msgs"), len(str(max_count)))
+
+        # Work out a reasonable label column width (cap at 60)
+        max_label_len = max(len(str(lbl)) for lbl, _ in items)
+        label_width = max(len(label_header), min(60, max_label_len))
+
+        header = f"{'#':>{rank_width}}  {label_header:<{label_width}}  {'Msgs':>{count_width}}"
+        print(header)
+        print("-" * len(header))
+
+        for idx, (label, count) in enumerate(items, start=1):
+            label_disp = shorten(str(label), width=label_width, placeholder="…")
+            print(f"{idx:>{rank_width}}  {label_disp:<{label_width}}  {count:>{count_width}}")
+
+    # Overall heading for this echo
+    print(f"TCOB1 EchoMail top stats for area {echo_name}")
+    print(f"(DB schema v{schema_version})")
+    print(f"Statistics from {nice_header_date(date_from)} to {nice_header_date(date_to)}")
+    print(f"Total messages in range: {len(rows)}")
+
+    print_top_table(poster_counts, "Poster", "Top posters")
+    print_top_table(subject_counts, "Subject", "Top subjects")
+
+    # Size-based tables (if available)
+    def _fmt_bytes(n: int) -> str:
+        if n is None:
+            return "0B"
+        n = int(n)
+        if n < 1024:
+            return f"{n}B"
+        if n < 1024 * 1024:
+            return f"{n/1024:.1f}K"
+        if n < 1024 * 1024 * 1024:
+            return f"{n/(1024*1024):.1f}M"
+        return f"{n/(1024*1024*1024):.1f}G"
+
+    if size_col:
+        print()
+        title = "Top posters by total message size"
+        print(title)
+        print("=" * len(title))
+
+        items = poster_total_bytes.most_common(limit)
+        if not items:
+            print("(no data)")
+        else:
+            rank_width = len(str(len(items)))
+            max_label_len = max(len(str(lbl)) for lbl, _ in items)
+            label_width = max(len("Poster"), min(40, max_label_len))
+
+            max_total = max(v for _, v in items)
+            total_width = max(len("Total"), len(_fmt_bytes(max_total)))
+
+            # Max size column is useful context
+            max_of_max = max(poster_max_bytes.get(p, 0) for p, _ in items)
+            max_width = max(len("Max"), len(_fmt_bytes(max_of_max)))
+
+            header = f"{'#':>{rank_width}}  {'Poster':<{label_width}}  {'Total':>{total_width}}  {'Max':>{max_width}}"
+            print(header)
+            print("-" * len(header))
+
+            for idx, (poster, total_b) in enumerate(items, start=1):
+                max_b = poster_max_bytes.get(poster, 0)
+                poster_disp = shorten(str(poster), width=label_width, placeholder="…")
+                print(f"{idx:>{rank_width}}  {poster_disp:<{label_width}}  {_fmt_bytes(total_b):>{total_width}}  {_fmt_bytes(max_b):>{max_width}}")
+
+        # Biggest individual messages
+        if biggest_msgs:
+            biggest_msgs.sort(key=lambda x: x[0], reverse=True)
+            top_big = biggest_msgs[:limit]
+            print()
+            title2 = "Largest individual messages"
+            print(title2)
+            print("=" * len(title2))
+            print(f"{'#':>2}  {'Size':>8}  {'Poster':<20}  Subject")
+            print("-" * 60)
+            for i, (sz, ln, poster, subj) in enumerate(top_big, start=1):
+                poster_disp = shorten(poster, width=20, placeholder="…")
+                subj_disp = shorten(subj, width=60, placeholder="…")
+                print(f"{i:>2}  {_fmt_bytes(sz):>8}  {poster_disp:<20}  {subj_disp}")
+    else:
+        print()
+        print("(NOTE: no message size column found in pkt_messages; add msg_size/message_size to your indexer to enable size-based TOP stats.)")
+
+# ----------------------------------------------------------------------
+# Known / only / exclude areas file loader
+# ----------------------------------------------------------------------
+
+def load_area_list(path: str):
+    """Load a list of echo areas from a file.
+
+    Supported formats:
+      * .txt/.lst: one area per line (blank and # lines ignored)
+      * .json: either a JSON list ["AREA1", "AREA2"] or {"areas": [...]}.
+    """
+    if not path:
+        return []
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = f.read()
+
+    # JSON if it looks like JSON or endswith .json
+    if path.lower().endswith(".json") or data.lstrip().startswith(("[", "{")):
+        obj = json.loads(data)
+        if isinstance(obj, list):
+            areas = obj
+        elif isinstance(obj, dict) and isinstance(obj.get("areas"), list):
+            areas = obj["areas"]
+        else:
+            raise SystemExit("Area JSON must be a list or an object with an 'areas' list")
+        out = []
+        for a in areas:
+            if not isinstance(a, str):
+                continue
+            a = a.strip()
+            if a:
+                out.append(a)
+        return out
+
+    # Plain text list
+    out = []
+    for line in data.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        out.append(line)
+    return out
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="TCOB1 EchoMail area reporter (SQLite pkt_index.db)"
+    )
+    ap.add_argument("--db", "-d", default="pkt_index.db", help="SQLite DB file (default: pkt_index.db)")
+    ap.add_argument("--from", dest="date_from", default=None, help="Start date/time (e.g. 2025-12-12)")
+    ap.add_argument("--to", dest="date_to", default=None, help="End date/time (e.g. 2025-12-17)")
+    ap.add_argument(
+        "--date",
+        type=str.upper,
+        choices=["WEEK", "MONTH", "CMONTH", "TMONTH"],
+        help=(
+            "Preset date ranges relative to DB max date: "
+            "WEEK = last 7 days, "
+            "MONTH = previous calendar month, "
+            "CMONTH = current calendar month so far, "
+            "TMONTH = trailing 7 calendar months (6 full months back plus the current month so far), "
+            "grouped as one column per month."
+        ),
+    )
+    ap.add_argument("--period", choices=["auto", "month", "day", "tmonth"], default="auto",
+                    help="Grouping period: month (09..12,13..15), day (12..17), "
+                         "tmonth (real calendar months, e.g. for --date=TMONTH), or auto (default)")
+    ap.add_argument("--days", type=int, default=None,
+                    help="Convenience: last N days ending at DB max date (overrides --from/--to)")
+    ap.add_argument("--known-areas", default=None,
+                    help="Optional file listing areas to always include (zero-count rows). "
+                         "Supports .txt (one per line) or .json ([..] or {\"areas\":[..]}).")
+    ap.add_argument("--only-areas", default=None,
+                    help="Optional file listing areas to report on exclusively (ignore others not listed). "
+                         "Same format as --known-areas.")
+    ap.add_argument("--exclude-areas", default=None,
+                    help="Optional file listing areas to exclude from the report. Same format as --known-areas.")
+    ap.add_argument("--top", metavar="ECHO", help="Show top posters/subjects for a single echo (instead of area summary)")
+    ap.add_argument("--area-width", type=int, default=34, help="Area column width (default: 34)")
+    args = ap.parse_args()
+
+    # Disallow conflicting date options with --date
+    if args.date and (args.days is not None or args.date_from or args.date_to):
+        raise SystemExit("--date cannot be combined with --from/--to/--days. Use only one date-range option.")
+
+    conn = sqlite3.connect(args.db)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # Ensure meta table exists + schema_version present (safe even for old DBs)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
+    cur.execute("""
+    INSERT OR IGNORE INTO meta (key, value)
+    VALUES ('schema_version', '1')
+    """)
+    conn.commit()
+
+    cur.execute("SELECT value FROM meta WHERE key='schema_version'")
+    row = cur.fetchone()
+    schema_version = row["value"] if row else "unknown"
+
+    # Validate pkt_messages exists
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pkt_messages'")
+    if not cur.fetchone():
+        raise SystemExit("No table pkt_messages found in this DB. Are you pointing at the right file?")
+
+    cur.execute("SELECT COUNT(*) AS c FROM pkt_messages")
+    total_rows = cur.fetchone()["c"]
+    if total_rows == 0:
+        # Allow zero-traffic reports if the user supplies a date range and a known-areas file
+        if not (args.known_areas and args.date_from and args.date_to):
+            raise SystemExit("pkt_messages is empty (0 rows).")
+
+    cols_in_table = table_columns(conn, "pkt_messages")
+    date_expr = pick_date_expression(cols_in_table)
+
+    # DB date range (or user-supplied range if there are no message rows yet)
+    if total_rows > 0:
+        cur.execute(f"SELECT MIN({date_expr}) AS mn, MAX({date_expr}) AS mx FROM pkt_messages")
+        r = cur.fetchone()
+        db_min_s, db_max_s = r["mn"], r["mx"]
+        if not db_min_s or not db_max_s:
+            raise SystemExit("Rows exist, but all date fields are empty (date_iso/imported_at/date_raw).")
+        db_min = parse_date_any(db_min_s)
+        db_max = parse_date_any(db_max_s)
+    else:
+        db_min_s, db_max_s = args.date_from, args.date_to
+        db_min = parse_date_any(db_min_s)
+        db_max = parse_date_any(db_max_s)
+
+    # Decide date range based on options
+    if args.date:
+        # Presets relative to DB max date
+        dt_to = db_max
+
+        if args.date == "WEEK":
+            # Last 7 days ending at db_max
+            dt_from = (dt_to - timedelta(days=6)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+
+        elif args.date == "CMONTH":
+            # Current month so far (first of month to db_max)
+            dt_from = dt_to.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        elif args.date == "MONTH":
+            # Previous full calendar month
+            year = dt_to.year
+            month = dt_to.month
+            if month == 1:
+                prev_year = year - 1
+                prev_month = 12
+            else:
+                prev_year = year
+                prev_month = month - 1
+
+            dt_from = datetime(prev_year, prev_month, 1, 0, 0, 0)
+            # First day of current month, then step back 1 second
+            first_this_month = datetime(year, month, 1, 0, 0, 0)
+            dt_to = first_this_month - timedelta(seconds=1)
+
+        elif args.date == "TMONTH":
+            # Trailing 7 calendar months: the current month (so far) plus the
+            # 6 full calendar months before it, ending at db_max.
+            year = dt_to.year
+            month = dt_to.month
+            for _ in range(6):
+                month -= 1
+                if month == 0:
+                    month = 12
+                    year -= 1
+            dt_from = datetime(year, month, 1, 0, 0, 0)
+
+        date_from = dt_from.strftime("%Y-%m-%d %H:%M:%S")
+        date_to = dt_to.strftime("%Y-%m-%d %H:%M:%S")
+
+    elif args.days is not None:
+        # User requested last N days
+        dt_to = db_max
+        dt_from = (db_max - timedelta(days=max(args.days - 1, 0))).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        date_from = dt_from.strftime("%Y-%m-%d %H:%M:%S")
+        date_to = dt_to.strftime("%Y-%m-%d %H:%M:%S")
+
+    else:
+        # Explicit from/to or full DB range
+        date_from = args.date_from or db_min_s
+        date_to = args.date_to or db_max_s
+        dt_from = parse_date_any(date_from)
+        dt_to = parse_date_any(date_to)
+
+    # If user requested a per-echo top report, do that and exit early
+    if args.top:
+        run_top_report(conn, date_expr, date_from, date_to, args.top, schema_version)
+        conn.close()
+        return
+
+    # Decide period
+    period = args.period
+    if period == "auto":
+        if args.date == "TMONTH":
+            period = "tmonth"
+        else:
+            span_days = (dt_to.date() - dt_from.date()).days
+            period = "day" if span_days <= 31 else "month"
+
+    # Build columns
+    col_width = 4
+    if period == "month":
+        # Default seasonal columns like your sample: 15..09
+        columns = [15, 14, 13, 12, 11, 10, 9]
+        col_header = " ".join(f"{c:>{col_width}d}" for c in columns)
+    elif period == "tmonth":
+        # Real calendar-month columns (e.g. for --date=TMONTH / trailing 7 months)
+        col_width = 6
+        columns = build_month_columns(dt_from, dt_to)
+        col_header = " ".join(
+            f"{datetime(y, m, 1).strftime('%b-%y'):>{col_width}s}" for (y, m) in columns
+        )
+    else:
+        day_cols = build_day_columns(dt_from, dt_to)
+        columns = day_cols
+        # Tidy day-only header even when month changes
+        col_header = " ".join(f"{d.strftime('%d'):>{col_width}s}" for d in columns)
+
+    # Query rows in range
+    cur.execute(
+        f"""
+        SELECT echo, {date_expr} AS any_date
+        FROM pkt_messages
+        WHERE {date_expr} >= ? AND {date_expr} <= ?
+        """,
+        (date_from, date_to),
+    )
+
+    counts = defaultdict(lambda: defaultdict(int))
+    areas_seen = set()
+    bad_dates = 0
+
+    for row in cur.fetchall():
+        area = (row["echo"] or "").strip().upper() or "UNKNOWN"
+        try:
+            dt = parse_date_any(row["any_date"])
+        except Exception:
+            bad_dates += 1
+            continue
+
+        if period == "month":
+            b = month_bucket(dt)
+            if b in columns:
+                counts[area][b] += 1
+        elif period == "tmonth":
+            key = (dt.year, dt.month)
+            if key in columns:
+                counts[area][key] += 1
+        else:
+            # Day keys are date objects (see build_day_columns)
+            key = dt.date()
+            if key in columns:
+                counts[area][key] += 1
+
+        areas_seen.add(area)
+
+    # Overlay a fixed list of areas so zero-count rows appear
+    if args.known_areas:
+        for a in load_area_list(args.known_areas):
+            areas_seen.add(a.strip().upper())
+
+    # Restrict report to ONLY areas listed in a file
+    only_areas_list = None
+    if args.only_areas:
+        only_areas_list = [a.strip().upper() for a in load_area_list(args.only_areas)]
+        # Ensure requested areas appear even if zero-count
+        for a in only_areas_list:
+            areas_seen.add(a)
+
+    # Areas to exclude
+    exclude_areas_list = None
+    if args.exclude_areas:
+        exclude_areas_list = [a.strip().upper() for a in load_area_list(args.exclude_areas)]
+        exclude_set = set(exclude_areas_list)
+    else:
+        exclude_set = set()
+
+    # Print report
+    print("TCOB1 EchoMail area reporter")
+    print(f"(DB schema v{schema_version})")
+    print()
+    print(f"Statistics from {nice_header_date(date_from)} to {nice_header_date(date_to)}")
+    print()
+
+    area_width = args.area_width
+    show_total = period != "tmonth"
+    header_suffix = "   Total" if show_total else ""
+    sep_extra = 8 if show_total else 0
+
+    # Keep tmonth reports within a classic 78-char terminal width by
+    # shrinking the area column (never below a sane minimum) rather than
+    # letting the line wrap.
+    MAX_LINE_WIDTH = 78
+    if period == "tmonth":
+        fixed_width = len(col_header) + sep_extra
+        max_area_width = MAX_LINE_WIDTH - fixed_width
+        area_width = max(10, min(area_width, max_area_width))
+
+    print(f"{'Area':<{area_width}}{col_header}{header_suffix}")
+    print("=" * (area_width + len(col_header) + sep_extra))
+
+    # Per-day totals across all included areas (for a totals row at the bottom)
+    day_totals = [0] * len(columns)
+    grand_total = 0
+
+    # Determine which areas to include (respect --only-areas and --exclude-areas)
+    if only_areas_list:
+        only_set = set(only_areas_list)
+        iter_areas = [a for a in sorted(areas_seen) if a in only_set]
+    else:
+        iter_areas = sorted(areas_seen)
+
+    if exclude_set:
+        iter_areas = [a for a in iter_areas if a not in exclude_set]
+
+    for area in iter_areas:
+        row_vals = [counts[area].get(c, 0) for c in columns]
+        # Accumulate day totals
+        for i, v in enumerate(row_vals):
+            day_totals[i] += v
+            grand_total += v
+
+        total = sum(row_vals)
+        vals_str = " ".join(f"{v:>{col_width}d}" for v in row_vals)
+        if show_total:
+            print(f"{shorten(area, width=area_width-1, placeholder='…'):<{area_width}}{vals_str} : {total:>5d}")
+        else:
+            print(f"{shorten(area, width=area_width-1, placeholder='…'):<{area_width}}{vals_str}")
+
+    # Totals row
+    total_width = area_width + len(col_header) + sep_extra
+    sep = ('==' * (total_width // 2)) + ('=' if (total_width % 2) else '')
+    print(sep)
+    totals_str = " ".join(f"{v:>{col_width}d}" for v in day_totals)
+    if show_total:
+        print(f"{'TOTALS':<{area_width}}{totals_str} : {grand_total:>5d}")
+    else:
+        print(f"{'TOTALS':<{area_width}}{totals_str}")
+
+    if bad_dates:
+        print()
+        print(f"(NOTE: skipped {bad_dates} rows with unparseable dates)")
+
+    conn.close()
 
 if __name__ == "__main__":
     main()
